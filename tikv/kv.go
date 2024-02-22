@@ -98,8 +98,9 @@ func createEtcdKV(addrs []string, tlsConfig *tls.Config) (*clientv3.Client, erro
 	return cli, nil
 }
 
-// update oracle's lastTS every 2000ms.
-var oracleUpdateInterval = 2000
+// Update oracle's lastTS every 2000ms by default. Can override at startup with an option to NewKVStore
+// or at runtime by calling SetLowResolutionTimestampUpdateInterval on the oracle
+var defaultOracleUpdateInterval = 2 * time.Second
 
 // KVStore contains methods to interact with a TiKV cluster.
 type KVStore struct {
@@ -194,6 +195,18 @@ func WithPDHTTPClient(tlsConf *tls.Config, pdaddrs []string) Option {
 	}
 }
 
+// WithUpdateInterval sets the frequency with which to refresh read timestamps
+// from the PD client. Smaller updateInterval will lead to more HTTP calls to
+// PD and less staleness on reads, and vice versa.
+func WithUpdateInterval(updateInterval time.Duration) Option {
+	return func(o *KVStore) {
+		err := o.oracle.SetLowResolutionTimestampUpdateInterval(updateInterval)
+		if err != nil {
+			panic(err)
+		}
+	}
+}
+
 // loadOption load KVStore option into KVStore.
 func loadOption(store *KVStore, opt ...Option) {
 	for _, f := range opt {
@@ -203,7 +216,7 @@ func loadOption(store *KVStore, opt ...Option) {
 
 // NewKVStore creates a new TiKV store instance.
 func NewKVStore(uuid string, pdClient pd.Client, spkv SafePointKV, tikvclient Client, opt ...Option) (*KVStore, error) {
-	o, err := oracles.NewPdOracle(pdClient, time.Duration(oracleUpdateInterval)*time.Millisecond)
+	o, err := oracles.NewPdOracle(pdClient, defaultOracleUpdateInterval)
 	if err != nil {
 		return nil, err
 	}
