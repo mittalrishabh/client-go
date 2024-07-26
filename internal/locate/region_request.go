@@ -40,13 +40,11 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
-	"reflect"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-	"unsafe"
 
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
@@ -1007,17 +1005,6 @@ func (s *replicaSelector) proxyReplica() *replica {
 	return nil
 }
 
-// sliceIdentical checks whether two slices are referencing the same block of memory. Two `nil`s are also considered
-// the same.
-func sliceIdentical[T any](a, b []T) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	aHeader := (*reflect.SliceHeader)(unsafe.Pointer(&a))
-	bHeader := (*reflect.SliceHeader)(unsafe.Pointer(&b))
-	return aHeader.Data == bHeader.Data
-}
-
 func (s *replicaSelector) refreshRegionStore() {
 	oldRegionStore := s.regionStore
 	newRegionStore := s.region.getStore()
@@ -1030,7 +1017,7 @@ func (s *replicaSelector) refreshRegionStore() {
 	// So we just compare the address here.
 	// When stores change, we mark this replicaSelector as invalid to let the caller
 	// recreate a new replicaSelector.
-	if !sliceIdentical(oldRegionStore.stores, newRegionStore.stores) {
+	if &oldRegionStore.stores != &newRegionStore.stores {
 		s.state = &invalidStore{}
 		return
 	}
