@@ -16,6 +16,7 @@ package locate
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/pingcap/kvproto/pkg/errorpb"
@@ -545,9 +546,65 @@ func (s *replicaSelector) onRegionNotFound(
 	return false, nil
 }
 
+// noisyTenantReasonSuffix marks a ServerIsBusy whose cause TiKV attributed to
+// the requesting resource group itself rather than to a neighbour. Kept in step
+// with NOISY_TENANT_REASON_SUFFIX in TiKV's resource_control crate; it rides the
+// free-form reason string so neither side needs a kvproto change.
+const noisyTenantReasonSuffix = "|noisy_tenant"
+
+// isNoisyTenantBusy reports whether TiKV blamed this request's own resource
+// group for the overload behind a ServerIsBusy. An untagged error means either
+// that no group was blamed or that the store does not speak this marker, and in
+// both cases the pre-existing handling applies.
+func isNoisyTenantBusy(serverIsBusy *errorpb.ServerIsBusy) bool {
+	return serverIsBusy != nil &&
+		strings.HasSuffix(serverIsBusy.GetReason(), noisyTenantReasonSuffix)
+}
+
+// onNoisyTenantServerIsBusy handles a ServerIsBusy that TiKV attributed to this
+// request's own resource group, by backing off and coming back to the leader.
+//
+// Redirecting such a request to a follower is counterproductive: a follower read
+// is served by asking this same leader for a ReadIndex, so it returns to the
+// store that just rejected it and adds raftstore work there instead of moving
+// the read somewhere with capacity. Nor is the store marked slow -- it is not
+// slow, one tenant is over its quota -- and a slow verdict is per store, so it
+// would steer every other tenant's reads off a store that is serving them fine.
+func (s *replicaSelector) onNoisyTenantServerIsBusy(
+	bo *retry.Backoffer, ctx *RPCContext, req *tikvrpc.Request, serverIsBusy *errorpb.ServerIsBusy,
+) (shouldRetry bool, err error) {
+	metrics.TiKVNoisyTenantServerBusyCounter.Inc()
+	if ctx != nil && ctx.Store != nil && serverIsBusy.EstimatedWaitMs != 0 {
+		ctx.Store.updateServerLoadStats(serverIsBusy.EstimatedWaitMs)
+	}
+	s.pinRetryToLeader(req)
+	backoffErr := errors.Errorf("server is busy (noisy tenant), ctx: %v", ctx)
+	if err = bo.Backoff(retry.BoTiKVServerBusy, backoffErr); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// pinRetryToLeader makes every remaining attempt on this selector go to the
+// leader. Clearing busyThreshold matters as much as the read type does:
+// nextForReplicaReadLeader diverts to an idle replica whenever the leader's
+// estimated wait exceeds the threshold, which is exactly the state a busy
+// leader is in. Leaving the leader unflagged keeps it a candidate.
+func (s *replicaSelector) pinRetryToLeader(req *tikvrpc.Request) {
+	req.SetReplicaReadType(kv.ReplicaReadLeader)
+	req.BusyThresholdMs = 0
+	req.StaleRead = false
+	s.replicaReadType = kv.ReplicaReadLeader
+	s.busyThreshold = 0
+	s.option.leaderOnly = true
+}
+
 func (s *replicaSelector) onServerIsBusy(
 	bo *retry.Backoffer, ctx *RPCContext, req *tikvrpc.Request, serverIsBusy *errorpb.ServerIsBusy,
 ) (shouldRetry bool, err error) {
+	if isNoisyTenantBusy(serverIsBusy) {
+		return s.onNoisyTenantServerIsBusy(bo, ctx, req, serverIsBusy)
+	}
 	var store *Store
 	if ctx != nil && ctx.Store != nil {
 		store = ctx.Store
