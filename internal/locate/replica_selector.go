@@ -571,12 +571,13 @@ func isNoisyTenantBusy(serverIsBusy *errorpb.ServerIsBusy) bool {
 // slow, one tenant is over its quota -- and a slow verdict is per store, so it
 // would steer every other tenant's reads off a store that is serving them fine.
 func (s *replicaSelector) onNoisyTenantServerIsBusy(
-	bo *retry.Backoffer, ctx *RPCContext, req *tikvrpc.Request, serverIsBusy *errorpb.ServerIsBusy,
+	bo *retry.Backoffer, ctx *RPCContext, req *tikvrpc.Request,
 ) (shouldRetry bool, err error) {
 	metrics.TiKVNoisyTenantServerBusyCounter.Inc()
-	if ctx != nil && ctx.Store != nil && serverIsBusy.EstimatedWaitMs != 0 {
-		ctx.Store.updateServerLoadStats(serverIsBusy.EstimatedWaitMs)
-	}
+	// EstimatedWaitMs is deliberately not recorded. It is the whole pool's
+	// wait, and updateServerLoadStats keeps it per store with no group
+	// dimension, so acting on it steers every other tenant off a store that is
+	// serving them fine -- the same reason markAlreadySlow is skipped here.
 	s.pinRetryToLeader(req)
 	backoffErr := errors.Errorf("server is busy (noisy tenant), ctx: %v", ctx)
 	if err = bo.Backoff(retry.BoTiKVServerBusy, backoffErr); err != nil {
@@ -603,7 +604,7 @@ func (s *replicaSelector) onServerIsBusy(
 	bo *retry.Backoffer, ctx *RPCContext, req *tikvrpc.Request, serverIsBusy *errorpb.ServerIsBusy,
 ) (shouldRetry bool, err error) {
 	if isNoisyTenantBusy(serverIsBusy) {
-		return s.onNoisyTenantServerIsBusy(bo, ctx, req, serverIsBusy)
+		return s.onNoisyTenantServerIsBusy(bo, ctx, req)
 	}
 	var store *Store
 	if ctx != nil && ctx.Store != nil {
