@@ -145,6 +145,21 @@ var (
 	ResourceControlInterceptor atomic.Pointer[resourceControlClient.ResourceGroupKVInterceptor]
 )
 
+// IsBackgroundRequest reports whether the request belongs to a background job
+// type of its resource group, the same classification the resource control
+// interceptor uses to skip consumption accounting.
+func IsBackgroundRequest(ctx context.Context, req *tikvrpc.Request) bool {
+	resourceGroupName := req.GetResourceControlContext().GetResourceGroupName()
+	if len(resourceGroupName) == 0 || len(req.RequestSource) == 0 {
+		return false
+	}
+	rcInterceptor := ResourceControlInterceptor.Load()
+	if rcInterceptor == nil {
+		return false
+	}
+	return (*rcInterceptor).IsBackgroundRequest(ctx, resourceGroupName, req.RequestSource)
+}
+
 func getResourceControlInfo(ctx context.Context, req *tikvrpc.Request) (
 	string,
 	resourceControlClient.ResourceGroupKVInterceptor,

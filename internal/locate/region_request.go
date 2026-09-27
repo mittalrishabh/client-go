@@ -121,6 +121,16 @@ type RegionRequestSender struct {
 	AccessStats       *ReplicaAccessStats
 }
 
+// countsTowardSlowScore reports whether the request's latency should feed the
+// store's prefer-leader slow score. Internal and background requests are left
+// out: TiKV runs background jobs at low priority and holds them back under load,
+// so their latency says little about the store's health.
+func countsTowardSlowScore(ctx context.Context, req *tikvrpc.Request) bool {
+	return req.ReplicaReadType == kv.ReplicaReadPreferLeader &&
+		!util.IsInternalRequest(req.RequestSource) &&
+		!client.IsBackgroundRequest(ctx, req)
+}
+
 func (s *RegionRequestSender) String() string {
 	if s.replicaSelector == nil {
 		return fmt.Sprintf("{rpcError:%v, replicaSelector: <nil>}", s.rpcError)
@@ -1286,7 +1296,7 @@ func (s *sendReqState) send() (canceled bool) {
 		collector.onResp(req, s.vars.resp, execDetails)
 
 		// Record timecost of external requests on related Store when `ReplicaReadMode == "PreferLeader"`.
-		if rpcCtx.Store != nil && req.ReplicaReadType == kv.ReplicaReadPreferLeader && !util.IsInternalRequest(req.RequestSource) {
+		if rpcCtx.Store != nil && countsTowardSlowScore(ctx, req) {
 			rpcCtx.Store.healthStatus.recordClientSideSlowScoreStat(rpcDuration)
 		}
 		if s.Stats != nil {
@@ -1465,7 +1475,7 @@ func (s *sendReqState) handleAsyncResponse(start time.Time, canceled bool, resp 
 	collector.onReq(req, execDetails)
 	collector.onResp(req, resp, execDetails)
 
-	if s.vars.rpcCtx.Store != nil && req.ReplicaReadType == kv.ReplicaReadPreferLeader && !util.IsInternalRequest(req.RequestSource) {
+	if s.vars.rpcCtx.Store != nil && countsTowardSlowScore(s.args.bo.GetCtx(), req) {
 		s.vars.rpcCtx.Store.healthStatus.recordClientSideSlowScoreStat(rpcDuration)
 	}
 	if s.vars.rpcCtx.ProxyStore != nil {

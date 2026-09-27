@@ -38,6 +38,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -65,6 +66,7 @@ import (
 	"github.com/tikv/client-go/v2/tikvrpc"
 	"github.com/tikv/client-go/v2/util"
 	"github.com/tikv/client-go/v2/util/async"
+	resourceControlClient "github.com/tikv/pd/client/resource_group/controller"
 	"go.uber.org/zap"
 )
 
@@ -1048,6 +1050,69 @@ func (s *testRegionRequestToThreeStoresSuite) TestSendReqWithReplicaSelector() {
 	s.False(sender.replicaSelector.region.isValid())
 	for _, store := range s.storeIDs {
 		s.cluster.StartStore(store)
+	}
+}
+
+// backgroundJobInterceptor treats a request as background when its source ends
+// in one of the job types, the way the PD resource group controller does.
+type backgroundJobInterceptor struct {
+	resourceControlClient.ResourceGroupKVInterceptor
+	jobTypes []string
+}
+
+func (i backgroundJobInterceptor) IsBackgroundRequest(_ context.Context, _, requestSource string) bool {
+	for _, jobType := range i.jobTypes {
+		if strings.HasSuffix(requestSource, "_"+jobType) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *testRegionRequestToThreeStoresSuite) TestBackgroundRequestIsKeptOutOfSlowScore() {
+	regionLoc, err := s.cache.LocateRegionByID(s.bo, s.regionID)
+	s.Nil(err)
+	s.NotNil(regionLoc)
+
+	var interceptor resourceControlClient.ResourceGroupKVInterceptor = backgroundJobInterceptor{jobTypes: []string{"br"}}
+	prev := client.ResourceControlInterceptor.Swap(&interceptor)
+	defer client.ResourceControlInterceptor.Store(prev)
+
+	sender := NewRegionRequestSender(s.cache, &fnClient{fn: func(
+		ctx context.Context, addr string, req *tikvrpc.Request, timeout time.Duration,
+	) (*tikvrpc.Response, error) {
+		return &tikvrpc.Response{Resp: &kvrpcpb.GetResponse{}}, nil
+	}}, oracle.NoopReadTSValidator{})
+	// Sends one prefer-leader request with the given source and reports whether
+	// its latency was added to the client-side slow score of any store.
+	send := func(source string) bool {
+		updates := func() (n uint64) {
+			for _, store := range s.cache.stores.filter(nil, nil) {
+				n += atomic.LoadUint64(&store.healthStatus.clientSideSlowScore.intervalUpdCount)
+			}
+			return n
+		}
+		before := updates()
+		req := tikvrpc.NewReplicaReadRequest(tikvrpc.CmdGet, &kvrpcpb.GetRequest{}, kv.ReplicaReadPreferLeader, nil)
+		req.ResourceControlContext = &kvrpcpb.ResourceControlContext{ResourceGroupName: "uds_010"}
+		req.RequestSource = source
+		bo := retry.NewBackoffer(context.Background(), -1)
+		resp, _, _, err := sender.SendReqCtx(bo, req, regionLoc.Region, time.Second, tikvrpc.TiKV)
+		s.Nil(err)
+		s.NotNil(resp)
+		return updates() > before
+	}
+
+	// The sync and async send paths each carry their own copy of the condition.
+	for _, async := range []bool{false, true} {
+		if async {
+			s.Nil(failpoint.Enable("tikvclient/useSendReqAsync", `return(true)`))
+		}
+		s.True(send("external_Select"), "foreground traffic is measured, async=%v", async)
+		s.False(send("external_br"), "a background job is not measured, async=%v", async)
+		if async {
+			s.Nil(failpoint.Disable("tikvclient/useSendReqAsync"))
+		}
 	}
 }
 
