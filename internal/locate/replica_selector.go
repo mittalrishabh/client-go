@@ -57,7 +57,7 @@ func newReplicaSelector(
 	if req.ReplicaReadType == kv.ReplicaReadPreferLeader {
 		WithPerferLeader()(&option)
 	}
-	return &replicaSelector{
+	selector := &replicaSelector{
 		baseReplicaSelector: baseReplicaSelector{
 			regionCache:   regionCache,
 			region:        cachedRegion,
@@ -70,7 +70,19 @@ func newReplicaSelector(
 		option:          option,
 		target:          nil,
 		attempts:        0,
-	}, nil
+	}
+	// A group still inside its noisy window goes straight to the leader. The
+	// first request of the window learned this from a ServerIsBusy; the rest
+	// would otherwise each pay for the same lesson, and every follower read
+	// they attempt lands a ReadIndex back on the leader that rejected them.
+	if regionCache.noisyTenants.isNoisy(
+		req.GetResourceControlContext().GetResourceGroupName(),
+		cachedRegion.GetLeaderStoreID(), time.Now(),
+	) {
+		metrics.TiKVNoisyTenantLeaderPinnedCounter.Inc()
+		selector.pinRetryToLeader(req)
+	}
+	return selector, nil
 }
 
 func buildTiKVReplicas(region *Region) []*replica {
@@ -578,12 +590,49 @@ func (s *replicaSelector) onNoisyTenantServerIsBusy(
 	// wait, and updateServerLoadStats keeps it per store with no group
 	// dimension, so acting on it steers every other tenant off a store that is
 	// serving them fine -- the same reason markAlreadySlow is skipped here.
+	s.markNoisyTenant(ctx, req)
+	return s.backoffOnLeader(bo, ctx, req)
+}
+
+// backoffOnLeader keeps the remaining attempts on the leader and backs off,
+// which is the whole of the noisy-tenant response: never divert to a follower,
+// and never blame the store.
+func (s *replicaSelector) backoffOnLeader(
+	bo *retry.Backoffer, ctx *RPCContext, req *tikvrpc.Request,
+) (shouldRetry bool, err error) {
 	s.pinRetryToLeader(req)
 	backoffErr := errors.Errorf("server is busy (noisy tenant), ctx: %v", ctx)
 	if err = bo.Backoff(retry.BoTiKVServerBusy, backoffErr); err != nil {
 		return false, err
 	}
 	return true, nil
+}
+
+// markNoisyTenant opens or extends this group's noisy window on the store that
+// rejected the request.
+func (s *replicaSelector) markNoisyTenant(ctx *RPCContext, req *tikvrpc.Request) {
+	if ctx == nil || ctx.Store == nil {
+		return
+	}
+	s.regionCache.noisyTenants.mark(
+		req.GetResourceControlContext().GetResourceGroupName(), ctx.Store.storeID, time.Now(),
+	)
+}
+
+// renewNoisyTenant holds an already-open window open when an ambiguous
+// overload signal -- an untagged ServerIsBusy, a deadline, a timeout -- arrives
+// for a group TiKV has already named. Reports whether a window was live.
+func (s *replicaSelector) renewNoisyTenant(ctx *RPCContext, req *tikvrpc.Request) bool {
+	if ctx == nil || ctx.Store == nil {
+		return false
+	}
+	if !s.regionCache.noisyTenants.renew(
+		req.GetResourceControlContext().GetResourceGroupName(), ctx.Store.storeID, time.Now(),
+	) {
+		return false
+	}
+	metrics.TiKVNoisyTenantWindowRenewedCounter.Inc()
+	return true
 }
 
 // pinRetryToLeader makes every remaining attempt on this selector go to the
@@ -605,6 +654,11 @@ func (s *replicaSelector) onServerIsBusy(
 ) (shouldRetry bool, err error) {
 	if isNoisyTenantBusy(serverIsBusy) {
 		return s.onNoisyTenantServerIsBusy(bo, ctx, req)
+	}
+	// An untagged ServerIsBusy names no group, so it cannot open a window, but
+	// a group already inside one is still contributing to the overload.
+	if s.renewNoisyTenant(ctx, req) {
+		return s.backoffOnLeader(bo, ctx, req)
 	}
 	var store *Store
 	if ctx != nil && ctx.Store != nil {

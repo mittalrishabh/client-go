@@ -1802,3 +1802,65 @@ func (s *testRegionRequestToThreeStoresSuite) TestStaleReadMetrics() {
 		}
 	}
 }
+
+func (s *testRegionRequestToThreeStoresSuite) TestNoisyTenantWindowPinsLaterRequests() {
+	defer s.cache.noisyTenants.sweep(context.Background(), time.Now().Add(time.Hour))
+
+	regionLoc, err := s.cache.LocateRegionByID(s.bo, s.regionID)
+	s.Nil(err)
+	newReq := func(group string) *tikvrpc.Request {
+		return tikvrpc.NewRequest(tikvrpc.CmdGet, &kvrpcpb.GetRequest{}, kvrpcpb.Context{
+			BusyThresholdMs:        50,
+			ResourceControlContext: &kvrpcpb.ResourceControlContext{ResourceGroupName: group},
+		})
+	}
+	bo := retry.NewBackoffer(context.Background(), -1)
+
+	// The first request of the window learns from the rejection itself.
+	req := newReq("uds_006")
+	sel, err := newReplicaSelector(s.cache, regionLoc.Region, req)
+	s.Nil(err)
+	s.Equal(uint32(50), req.BusyThresholdMs)
+	rpcCtx, err := sel.next(bo, req)
+	s.Nil(err)
+	s.Equal(rpcCtx.Peer.Id, s.leaderPeer)
+
+	retryable, err := sel.onServerIsBusy(bo, rpcCtx, req, &errorpb.ServerIsBusy{
+		EstimatedWaitMs: 500,
+		Reason:          "scheduler is busy|noisy_tenant",
+	})
+	s.Nil(err)
+	s.True(retryable)
+
+	// Every later request from the same group on that leader is pinned on
+	// arrival, so none of them attempts a follower read whose ReadIndex would
+	// land back on the leader that just rejected them.
+	next := newReq("uds_006")
+	sel2, err := newReplicaSelector(s.cache, regionLoc.Region, next)
+	s.Nil(err)
+	s.Zero(next.BusyThresholdMs)
+	s.True(sel2.option.leaderOnly)
+	rpcCtx2, err := sel2.next(bo, next)
+	s.Nil(err)
+	s.Equal(rpcCtx2.Peer.Id, s.leaderPeer)
+	s.False(next.ReplicaRead)
+	s.False(rpcCtx2.Store.healthStatus.IsSlow())
+
+	// A neighbour on the same store keeps load-based replica read.
+	other := newReq("uds_007")
+	sel3, err := newReplicaSelector(s.cache, regionLoc.Region, other)
+	s.Nil(err)
+	s.Equal(uint32(50), other.BusyThresholdMs)
+	s.False(sel3.option.leaderOnly)
+
+	// An untagged ServerIsBusy names no group, so it must not open a window
+	// for the neighbour that merely shares the overloaded store.
+	rpcCtx3, err := sel3.next(bo, other)
+	s.Nil(err)
+	_, err = sel3.onServerIsBusy(bo, rpcCtx3, other, &errorpb.ServerIsBusy{EstimatedWaitMs: 500})
+	s.Nil(err)
+	after := newReq("uds_007")
+	sel4, err := newReplicaSelector(s.cache, regionLoc.Region, after)
+	s.Nil(err)
+	s.False(sel4.option.leaderOnly)
+}

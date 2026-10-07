@@ -669,6 +669,11 @@ type RegionCache struct {
 	clusterID uint64
 
 	inflightUpdateBuckets sync.Map
+
+	// resource groups TiKV has recently blamed for its own overload, kept per
+	// store so their reads stay on the leader instead of bouncing off
+	// followers that have to consult that same leader.
+	noisyTenants noisyTenants
 }
 
 type regionCacheOptions struct {
@@ -758,6 +763,7 @@ func NewRegionCache(pdClient pd.Client, opt ...RegionCacheOpt) *RegionCache {
 	}
 	updater := &storeCacheUpdater{stores: c.stores}
 	c.bg.schedule(updater.tick, refreshStoreListInterval)
+	c.bg.schedule(c.noisyTenants.sweep, noisyTenantSweepInterval)
 	return c
 }
 

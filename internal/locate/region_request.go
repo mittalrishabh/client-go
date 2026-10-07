@@ -1732,10 +1732,15 @@ func (s *RegionRequestSender) onSendFail(bo *retry.Backoffer, ctx *RPCContext, r
 		metrics.TiKVRPCErrorCounter.WithLabelValues("shutting-down", storeLabel).Inc()
 		return errors.WithStack(tikverr.ErrTiDBShuttingDown)
 	} else if isCauseByDeadlineExceeded(err) {
-		if s.replicaSelector != nil && s.replicaSelector.onReadReqConfigurableTimeout(req) {
-			errLabel := "read-timeout-" + strconv.FormatUint(req.MaxExecutionDurationMs, 10) + "ms"
-			metrics.TiKVRPCErrorCounter.WithLabelValues(errLabel, storeLabel).Inc()
-			return nil
+		if s.replicaSelector != nil {
+			// Same reasoning as the DeadlineExceeded region error: a timeout
+			// only renews a window that TiKV already opened for this group.
+			s.replicaSelector.renewNoisyTenant(ctx, req)
+			if s.replicaSelector.onReadReqConfigurableTimeout(req) {
+				errLabel := "read-timeout-" + strconv.FormatUint(req.MaxExecutionDurationMs, 10) + "ms"
+				metrics.TiKVRPCErrorCounter.WithLabelValues(errLabel, storeLabel).Inc()
+				return nil
+			}
 		}
 	}
 	if status.Code(errors.Cause(err)) == codes.Canceled {
@@ -2203,8 +2208,15 @@ func (s *RegionRequestSender) onRegionError(
 		return true, nil
 	}
 
-	if isDeadlineExceeded(regionErr) && s.replicaSelector != nil && s.replicaSelector.onReadReqConfigurableTimeout(req) {
-		return true, nil
+	if isDeadlineExceeded(regionErr) && s.replicaSelector != nil {
+		// Ambiguous alone -- every tenant on an overloaded store sees these --
+		// but for a group TiKV has already named it is more of the same
+		// overload, so hold its window open rather than let it lapse and have
+		// the next request rediscover the rejection from a follower.
+		s.replicaSelector.renewNoisyTenant(ctx, req)
+		if s.replicaSelector.onReadReqConfigurableTimeout(req) {
+			return true, nil
+		}
 	}
 
 	if mismatch := regionErr.GetMismatchPeerId(); mismatch != nil {

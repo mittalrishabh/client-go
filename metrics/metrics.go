@@ -99,6 +99,8 @@ var (
 	TiKVMinSafeTSGapSeconds                        *prometheus.GaugeVec
 	TiKVReplicaSelectorFailureCounter              *prometheus.CounterVec
 	TiKVNoisyTenantServerBusyCounter               prometheus.Counter
+	TiKVNoisyTenantWindowRenewedCounter            prometheus.Counter
+	TiKVNoisyTenantLeaderPinnedCounter             prometheus.Counter
 	TiKVRequestRetryTimesHistogram                 prometheus.Histogram
 	TiKVTxnCommitBackoffSeconds                    prometheus.Histogram
 	TiKVTxnCommitBackoffCount                      prometheus.Histogram
@@ -692,6 +694,24 @@ func initMetrics(namespace, subsystem string, constLabels prometheus.Labels) {
 			ConstLabels: constLabels,
 		})
 
+	TiKVNoisyTenantWindowRenewedCounter = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Namespace:   namespace,
+			Subsystem:   subsystem,
+			Name:        "noisy_tenant_window_renewed_total",
+			Help:        "Counter of ambiguous overload signals (untagged ServerIsBusy, deadline exceeded, timeout) that extended an already-open noisy-tenant window.",
+			ConstLabels: constLabels,
+		})
+
+	TiKVNoisyTenantLeaderPinnedCounter = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Namespace:   namespace,
+			Subsystem:   subsystem,
+			Name:        "noisy_tenant_leader_pinned_total",
+			Help:        "Counter of requests pinned to the leader on arrival because their resource group was still inside a noisy-tenant window.",
+			ConstLabels: constLabels,
+		})
+
 	TiKVRequestRetryTimesHistogram = prometheus.NewHistogram(
 		prometheus.HistogramOpts{
 			Namespace:   namespace,
@@ -1064,6 +1084,8 @@ func RegisterMetrics() {
 	prometheus.MustRegister(TiKVMinSafeTSGapSeconds)
 	prometheus.MustRegister(TiKVReplicaSelectorFailureCounter)
 	prometheus.MustRegister(TiKVNoisyTenantServerBusyCounter)
+	prometheus.MustRegister(TiKVNoisyTenantWindowRenewedCounter)
+	prometheus.MustRegister(TiKVNoisyTenantLeaderPinnedCounter)
 	prometheus.MustRegister(TiKVRequestRetryTimesHistogram)
 	prometheus.MustRegister(TiKVTxnCommitBackoffSeconds)
 	prometheus.MustRegister(TiKVTxnCommitBackoffCount)
