@@ -1734,8 +1734,16 @@ func (s *RegionRequestSender) onSendFail(bo *retry.Backoffer, ctx *RPCContext, r
 	} else if isCauseByDeadlineExceeded(err) {
 		if s.replicaSelector != nil {
 			// Same reasoning as the DeadlineExceeded region error: a timeout
-			// only renews a window that TiKV already opened for this group.
-			s.replicaSelector.renewNoisyTenant(ctx, req)
+			// only renews a window that TiKV already opened for this group,
+			// and a group inside its window backs off before it retries
+			// rather than fast-retrying into the same overload.
+			if s.replicaSelector.renewNoisyTenant(ctx, req) {
+				metrics.TiKVRPCErrorCounter.WithLabelValues("noisy-tenant-timeout", storeLabel).Inc()
+				if _, err := s.replicaSelector.backoffOnLeader(bo, ctx, req); err != nil {
+					return err
+				}
+				return nil
+			}
 			if s.replicaSelector.onReadReqConfigurableTimeout(req) {
 				errLabel := "read-timeout-" + strconv.FormatUint(req.MaxExecutionDurationMs, 10) + "ms"
 				metrics.TiKVRPCErrorCounter.WithLabelValues(errLabel, storeLabel).Inc()
@@ -2212,8 +2220,13 @@ func (s *RegionRequestSender) onRegionError(
 		// Ambiguous alone -- every tenant on an overloaded store sees these --
 		// but for a group TiKV has already named it is more of the same
 		// overload, so hold its window open rather than let it lapse and have
-		// the next request rediscover the rejection from a follower.
-		s.replicaSelector.renewNoisyTenant(ctx, req)
+		// the next request rediscover the rejection from a follower. While
+		// the window is open the retry also backs off: a stale or follower
+		// read that fast-retried here would only add another request to the
+		// store that just could not finish the previous one.
+		if s.replicaSelector.renewNoisyTenant(ctx, req) {
+			return s.replicaSelector.backoffOnLeader(bo, ctx, req)
+		}
 		if s.replicaSelector.onReadReqConfigurableTimeout(req) {
 			return true, nil
 		}

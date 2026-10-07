@@ -621,7 +621,10 @@ func (s *replicaSelector) markNoisyTenant(ctx *RPCContext, req *tikvrpc.Request)
 
 // renewNoisyTenant holds an already-open window open when an ambiguous
 // overload signal -- an untagged ServerIsBusy, a deadline, a timeout -- arrives
-// for a group TiKV has already named. Reports whether a window was live.
+// for a group TiKV has already named. Reports whether a window was live, which
+// callers use to back off on the leader instead of fast-retrying: inside the
+// window every such signal is treated as the same overload, whatever read
+// type the request started with.
 func (s *replicaSelector) renewNoisyTenant(ctx *RPCContext, req *tikvrpc.Request) bool {
 	if ctx == nil || ctx.Store == nil {
 		return false

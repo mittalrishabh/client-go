@@ -1864,3 +1864,104 @@ func (s *testRegionRequestToThreeStoresSuite) TestNoisyTenantWindowPinsLaterRequ
 	s.Nil(err)
 	s.False(sel4.option.leaderOnly)
 }
+
+func (s *testRegionRequestToThreeStoresSuite) TestNoisyTenantTimeoutBacksOffOnLeader() {
+	defer s.cache.noisyTenants.sweep(context.Background(), time.Now().Add(time.Hour))
+
+	regionLoc, err := s.cache.LocateRegionByID(s.bo, s.regionID)
+	s.Nil(err)
+	region := s.cache.GetCachedRegionWithRLock(regionLoc.Region)
+	s.NotNil(region)
+	leaderStore := region.GetLeaderStoreID()
+	var followerStore uint64
+	for _, r := range buildTiKVReplicas(region) {
+		if r.store.storeID != leaderStore {
+			followerStore = r.store.storeID
+			break
+		}
+	}
+	s.NotZero(followerStore)
+
+	// A stale read with a short configurable timeout, the shape that today
+	// fast-retries a deadline without any backoff.
+	newStaleReq := func(group string) *tikvrpc.Request {
+		req := tikvrpc.NewRequest(tikvrpc.CmdGet, &kvrpcpb.GetRequest{}, kvrpcpb.Context{
+			StaleRead:              true,
+			ResourceControlContext: &kvrpcpb.ResourceControlContext{ResourceGroupName: group},
+		})
+		req.ReplicaReadType = kv.ReplicaReadMixed
+		req.MaxExecutionDurationMs = 100
+		return req
+	}
+	// Point the selector at the follower so the deadline comes from the
+	// store the window is keyed on, as it would for a real stale read.
+	targetFollower := func(sel *replicaSelector) *RPCContext {
+		for _, r := range sel.replicas {
+			if r.store.storeID == followerStore {
+				sel.target = r
+				break
+			}
+		}
+		s.NotNil(sel.target)
+		return &RPCContext{Region: regionLoc.Region, Meta: region.meta, Peer: sel.target.peer, Store: sel.target.store}
+	}
+
+	// Outside a window a deadline is ambiguous: fast retry, no sleep.
+	req := newStaleReq("uds_006")
+	sender := NewRegionRequestSender(s.cache, s.regionRequestSender.client, oracle.NoopReadTSValidator{})
+	sender.replicaSelector, err = newReplicaSelector(s.cache, regionLoc.Region, req)
+	s.Nil(err)
+	rpcCtx := targetFollower(sender.replicaSelector)
+	bo := retry.NewBackoffer(context.Background(), -1)
+	retryable, err := sender.onRegionError(bo, rpcCtx, req, &errorpb.Error{Message: "Deadline is exceeded"})
+	s.Nil(err)
+	s.True(retryable)
+	s.Zero(bo.GetTotalSleep())
+	s.True(sender.replicaSelector.target.hasFlag(deadlineErrUsingConfTimeoutFlag))
+	s.False(sender.replicaSelector.option.leaderOnly)
+
+	// TiKV blames the group on the follower store, opening a window there.
+	s.cache.noisyTenants.mark("uds_006", followerStore, time.Now())
+
+	// A DeadlineExceeded region error inside the window backs off and pins
+	// the remaining attempts to the leader instead of fast-retrying.
+	req = newStaleReq("uds_006")
+	sender.replicaSelector, err = newReplicaSelector(s.cache, regionLoc.Region, req)
+	s.Nil(err)
+	s.False(sender.replicaSelector.option.leaderOnly) // window is on the follower, not the leader
+	rpcCtx = targetFollower(sender.replicaSelector)
+	bo = retry.NewBackoffer(context.Background(), -1)
+	retryable, err = sender.onRegionError(bo, rpcCtx, req, &errorpb.Error{Message: "Deadline is exceeded"})
+	s.Nil(err)
+	s.True(retryable)
+	s.Greater(bo.GetTotalSleep(), 0)
+	s.True(sender.replicaSelector.option.leaderOnly)
+	s.False(req.StaleRead)
+	s.Equal(kv.ReplicaReadLeader, req.ReplicaReadType)
+	s.False(sender.replicaSelector.target.hasFlag(deadlineErrUsingConfTimeoutFlag))
+	next, err := sender.replicaSelector.next(bo, req)
+	s.Nil(err)
+	s.Equal(leaderStore, next.Store.storeID)
+
+	// An RPC-level deadline takes the same path.
+	req = newStaleReq("uds_006")
+	sender.replicaSelector, err = newReplicaSelector(s.cache, regionLoc.Region, req)
+	s.Nil(err)
+	rpcCtx = targetFollower(sender.replicaSelector)
+	bo = retry.NewBackoffer(context.Background(), -1)
+	s.Nil(sender.onSendFail(bo, rpcCtx, req, context.DeadlineExceeded))
+	s.Greater(bo.GetTotalSleep(), 0)
+	s.True(sender.replicaSelector.option.leaderOnly)
+	s.False(req.StaleRead)
+
+	// A neighbour sharing the follower store is untouched.
+	other := newStaleReq("uds_007")
+	sender.replicaSelector, err = newReplicaSelector(s.cache, regionLoc.Region, other)
+	s.Nil(err)
+	rpcCtx = targetFollower(sender.replicaSelector)
+	bo = retry.NewBackoffer(context.Background(), -1)
+	s.Nil(sender.onSendFail(bo, rpcCtx, other, context.DeadlineExceeded))
+	s.Zero(bo.GetTotalSleep())
+	s.False(sender.replicaSelector.option.leaderOnly)
+	s.True(other.StaleRead)
+}
